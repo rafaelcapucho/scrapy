@@ -133,6 +133,13 @@ class S3FeedStorage(BlockingFeedStorage):
         self.s3_client = session.create_client(
             's3', aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key)
+
+        mpu = self.s3_client.create_multipart_upload(Bucket=self.bucketname, Key=self.keyname)
+        self.mpu_id = mpu['UploadId']
+        logger.info(f'mpu_id: {self.mpu_id}')
+        self.mpu_parts = []
+        self.mpu_count = 0
+
         if feed_options and feed_options.get('overwrite', True) is False:
             logger.warning('S3 does not support appending to files. To '
                            'suppress this warning, remove the overwrite '
@@ -149,12 +156,35 @@ class S3FeedStorage(BlockingFeedStorage):
             feed_options=feed_options,
         )
 
+    def _complete_multipart_upload(self):
+        logger.info(f'parts: {self.mpu_parts}')
+        logger.info(f'mpu_id: {self.mpu_id}')
+        logger.info(f'mpu_count: {self.mpu_count}')
+        result = self.s3_client.complete_multipart_upload(
+            Bucket=self.bucketname,
+            Key=self.keyname,
+            UploadId=self.mpu_id,
+            MultipartUpload={"Parts": self.mpu_parts}
+        )
+
     def _store_in_thread(self, file):
         file.seek(0)
         kwargs = {'ACL': self.acl} if self.acl else {}
-        self.s3_client.put_object(
-            Bucket=self.bucketname, Key=self.keyname, Body=file,
-            **kwargs)
+        # self.s3_client.put_object(
+            # Bucket=self.bucketname, Key=self.keyname, Body=file,
+            # **kwargs)
+        self.mpu_count += 1
+        part = self.s3_client.upload_part(
+            Body=file, 
+            Bucket=self.bucketname, 
+            Key=self.keyname, 
+            UploadId=self.mpu_id,
+            PartNumber=self.mpu_count
+        )
+        self.mpu_parts.append({'PartNumber': self.mpu_count, 'ETag': part['ETag']})
+
+        logger.info(f'parts: {self.mpu_parts}')
+
         file.close()
 
 
@@ -302,6 +332,7 @@ class FeedExporter:
         for slot in self.slots:
             d = self._close_slot(slot, spider)
             deferred_list.append(d)
+            slot.storage._complete_multipart_upload()
         return defer.DeferredList(deferred_list) if deferred_list else None
 
     def _close_slot(self, slot, spider):
@@ -473,7 +504,7 @@ class FeedExporter:
             params[k] = getattr(spider, k)
         utc_now = datetime.utcnow()
         params['time'] = utc_now.replace(microsecond=0).isoformat().replace(':', '-')
-        params['batch_time'] = utc_now.isoformat().replace(':', '-')
+        params['batch_time'] = 'static-str' #utc_now.isoformat().replace(':', '-')
         params['batch_id'] = slot.batch_id + 1 if slot is not None else 1
         uripar_function = load_object(uri_params) if uri_params else lambda x, y: None
         uripar_function(params, spider)
