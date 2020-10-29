@@ -134,6 +134,7 @@ class S3FeedStorage(BlockingFeedStorage):
             's3', aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key)
 
+        self.keyname = 'arquivo.jl'
         mpu = self.s3_client.create_multipart_upload(Bucket=self.bucketname, Key=self.keyname)
         self.mpu_id = mpu['UploadId']
         logger.info(f'mpu_id: {self.mpu_id}')
@@ -157,6 +158,7 @@ class S3FeedStorage(BlockingFeedStorage):
         )
 
     def _complete_multipart_upload(self):
+        logger.info('calling the completing...')
         logger.info(f'parts: {self.mpu_parts}')
         logger.info(f'mpu_id: {self.mpu_id}')
         logger.info(f'mpu_count: {self.mpu_count}')
@@ -168,12 +170,14 @@ class S3FeedStorage(BlockingFeedStorage):
         )
 
     def _store_in_thread(self, file):
+        logger.info('initiating the upload..')
         file.seek(0)
         kwargs = {'ACL': self.acl} if self.acl else {}
         # self.s3_client.put_object(
             # Bucket=self.bucketname, Key=self.keyname, Body=file,
             # **kwargs)
         self.mpu_count += 1
+        logger.info(f'\n\nkeyname: {self.keyname}, bucket: {self.bucketname}\n\n\n')
         part = self.s3_client.upload_part(
             Body=file, 
             Bucket=self.bucketname, 
@@ -285,6 +289,7 @@ class FeedExporter:
         self.settings = crawler.settings
         self.feeds = {}
         self.slots = []
+        self.long_living_storage_obj = None
 
         if not self.settings['FEEDS'] and not self.settings['FEED_URI']:
             raise NotConfigured
@@ -321,7 +326,7 @@ class FeedExporter:
             uri_params = self._get_uri_params(spider, feed_options['uri_params'])
             self.slots.append(self._start_new_batch(
                 batch_id=1,
-                uri=uri % uri_params,
+                uri='s3://scrapinghub-test/arquivo.jl', #uri % uri_params,
                 feed_options=feed_options,
                 spider=spider,
                 uri_template=uri,
@@ -409,9 +414,10 @@ class FeedExporter:
             ):
                 uri_params = self._get_uri_params(spider, self.feeds[slot.uri_template]['uri_params'], slot)
                 self._close_slot(slot, spider)
+                logger.info(f'\n\n {slot.uri_template % uri_params} \n\n')
                 slots.append(self._start_new_batch(
                     batch_id=slot.batch_id + 1,
-                    uri=slot.uri_template % uri_params,
+                    uri='s3://scrapinghub-test/arquivo.jl', #slot.uri_template % uri_params,
                     feed_options=self.feeds[slot.uri_template],
                     spider=spider,
                     uri_template=slot.uri_template,
@@ -479,7 +485,11 @@ class FeedExporter:
         It supports not passing the *feed_options* parameters to classes that
         do not support it, and issuing a deprecation warning instead.
         """
-        feedcls = self.storages[urlparse(uri).scheme]
+        scheme = urlparse(uri).scheme
+        if scheme == 's3' and self.long_living_storage_obj:
+            return self.long_living_storage_obj
+
+        feedcls = self.storages[scheme]
         crawler = getattr(self, 'crawler', None)
 
         def build_instance(builder, *preargs):
@@ -494,8 +504,13 @@ class FeedExporter:
         else:
             instance = build_instance(feedcls)
             method_name = '__new__'
+
         if instance is None:
             raise TypeError("%s.%s returned None" % (feedcls.__qualname__, method_name))
+
+        if scheme == 's3' and not self.long_living_storage_obj:
+            self.long_living_storage_obj = instance
+
         return instance
 
     def _get_uri_params(self, spider, uri_params, slot=None):
@@ -504,7 +519,7 @@ class FeedExporter:
             params[k] = getattr(spider, k)
         utc_now = datetime.utcnow()
         params['time'] = utc_now.replace(microsecond=0).isoformat().replace(':', '-')
-        params['batch_time'] = 'static-str' #utc_now.isoformat().replace(':', '-')
+        params['batch_time'] = utc_now.isoformat().replace(':', '-')
         params['batch_id'] = slot.batch_id + 1 if slot is not None else 1
         uripar_function = load_object(uri_params) if uri_params else lambda x, y: None
         uripar_function(params, spider)
